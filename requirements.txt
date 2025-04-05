@@ -1,0 +1,11 @@
+streamlit
+PyPDF2
+python-pptx
+requests
+beautifulsoup4
+nltk
+numpy
+faiss-cpu
+boto3
+langchain[aws,openai]
+tiktoken
