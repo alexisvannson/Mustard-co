@@ -1,409 +1,479 @@
-import streamlit as st
+#!/usr/bin/env python3
+
+import argparse
 import os
-import tempfile
-import io
+import subprocess
+from contextlib import asynccontextmanager
+from typing import Any, Dict
+from io import BytesIO
 from PyPDF2 import PdfReader
-from pptx import Presentation
-import requests
-from bs4 import BeautifulSoup
-import re
-import nltk
-from nltk.tokenize import sent_tokenize
-import numpy as np
-import faiss
-import boto3
-from langchain_aws import BedrockEmbeddings
-from langchain_openai import OpenAIEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-import tiktoken
+from pdfminer.high_level import extract_text
+import datetime 
 
-# Download NLTK data
-nltk.download('punkt', quiet=True)
+import aiohttp
+from dotenv import load_dotenv
+from fastapi import UploadFile, File
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse
 
-# Set up the page
-st.set_page_config(page_title="Document Parser & Vector Search", layout="wide")
-st.title("Document Parser & Vector Search")
+from pipecat.transports.services.helpers.daily_rest import DailyRESTHelper, DailyRoomParams
 
-# Initialize session state variables
-if 'chunks' not in st.session_state:
-    st.session_state.chunks = []
-if 'faiss_index' not in st.session_state:
-    st.session_state.faiss_index = None
-if 'embeddings' not in st.session_state:
-    st.session_state.embeddings = None
-if 'document_content' not in st.session_state:
-    st.session_state.document_content = ""
-if 'parsed_documents' not in st.session_state:
-    st.session_state.parsed_documents = []
+# Load environment variables from .env file
+load_dotenv(override=True)
 
-# Functions for document parsing
-def extract_text_from_pdf(pdf_file):
-    reader = PdfReader(pdf_file)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text() + "\n"
-    return text
+# Maximum number of bot instances allowed per room
+MAX_BOTS_PER_ROOM = 1
 
-def extract_text_from_pptx(pptx_file):
-    prs = Presentation(pptx_file)
-    text = ""
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            if hasattr(shape, "text"):
-                text += shape.text + "\n"
-    return text
+# Dictionary to track bot processes: {pid: (process, room_url)}
+bot_procs = {}
 
-def extract_text_from_html(html_content):
-    soup = BeautifulSoup(html_content, 'html.parser')
+# Store Daily API helpers
+daily_helpers = {}
+
+
+def cleanup():
+    """Cleanup function to terminate all bot processes.
+
+    Called during server shutdown.
+    """
+    for entry in bot_procs.values():
+        proc = entry[0]
+        proc.terminate()
+        proc.wait()
+
+
+def get_bot_file():
+    bot_implementation = os.getenv("BOT_IMPLEMENTATION", "openai").lower().strip()
+    # If blank or None, default to openai
+    if not bot_implementation:
+        bot_implementation = "openai"
+    if bot_implementation not in ["openai", "gemini", "mistral"]:
+        raise ValueError(
+            f"Invalid BOT_IMPLEMENTATION: {bot_implementation}. Must be 'openai' or 'gemini', or 'mistral'"
+        )
+    return f"bot-{bot_implementation}"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI lifespan manager that handles startup and shutdown tasks.
+
+    - Creates aiohttp session
+    - Initializes Daily API helper
+    - Cleans up resources on shutdown
+    """
+    aiohttp_session = aiohttp.ClientSession()
+    daily_helpers["rest"] = DailyRESTHelper(
+        daily_api_key=os.getenv("DAILY_API_KEY", ""),
+        daily_api_url=os.getenv("DAILY_API_URL", "https://api.daily.co/v1"),
+        aiohttp_session=aiohttp_session,
+    )
+    yield
+    await aiohttp_session.close()
+    cleanup()
+
+
+# Initialize FastAPI app with lifespan manager
+app = FastAPI(lifespan=lifespan)
+
+# Configure CORS to allow requests from any origin
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+async def create_room_and_token() -> tuple[str, str]:
+    """Helper function to create a Daily room and generate an access token.
+
+    Returns:
+        tuple[str, str]: A tuple containing (room_url, token)
+
+    Raises:
+        HTTPException: If room creation or token generation fails
+    """
+    room_url = os.getenv("DAILY_SAMPLE_ROOM_URL", None)
+    token = os.getenv("DAILY_SAMPLE_ROOM_TOKEN", None)
+    if not room_url:
+        room = await daily_helpers["rest"].create_room(DailyRoomParams())
+        if not room.url:
+            raise HTTPException(status_code=500, detail="Failed to create room")
+        room_url = room.url
+
+        token = await daily_helpers["rest"].get_token(room_url)
+        if not token:
+            raise HTTPException(status_code=500, detail=f"Failed to get token for room: {room_url}")
+
+    return room_url, token
+
+
+@app.get("/")
+async def start_agent(request: Request):
+    """Endpoint for direct browser access to the bot.
+
+    Creates a room, starts a bot instance, and redirects to the Daily room URL.
+
+    Returns:
+        RedirectResponse: Redirects to the Daily room URL
+
+    Raises:
+        HTTPException: If room creation, token generation, or bot startup fails
+    """
+    print("Creating room")
+    room_url, token = await create_room_and_token()
+    print(f"Room URL: {room_url}")
+
+    # Check if there is already an existing process running in this room
+    num_bots_in_room = sum(
+        1 for proc in bot_procs.values() if proc[1] == room_url and proc[0].poll() is None
+    )
+    if num_bots_in_room >= MAX_BOTS_PER_ROOM:
+        raise HTTPException(status_code=500, detail=f"Max bot limit reached for room: {room_url}")
+
+    # Spawn a new bot process
+    try:
+        bot_file = get_bot_file()
+        proc = subprocess.Popen(
+            f"python -m {bot_file} -u {room_url} -t {token}",
+            shell=True,
+            bufsize=1,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        bot_procs[proc.pid] = (proc, room_url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start subprocess: {e}")
+
+    return RedirectResponse(room_url)
+
+
+@app.post("/connect")
+async def rtvi_connect(request: Request) -> Dict[Any, Any]:
+    """RTVI connect endpoint that creates a room and returns connection credentials.
+
+    This endpoint is called by RTVI clients to establish a connection.
+
+    Returns:
+        Dict[Any, Any]: Authentication bundle containing room_url and token
+
+    Raises:
+        HTTPException: If room creation, token generation, or bot startup fails
+    """
+    print("Creating room for RTVI connection")
+    room_url, token = await create_room_and_token()
+    print(f"Room URL: {room_url}")
+
+    # Start the bot process
+    try:
+        bot_file = get_bot_file()
+        proc = subprocess.Popen(
+            f"python3 -m {bot_file} -u {room_url} -t {token}",
+            shell=True,
+            bufsize=1,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        bot_procs[proc.pid] = (proc, room_url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start subprocess: {e}")
+
+    # Return the authentication bundle in format expected by DailyTransport
+    return {"room_url": room_url, "token": token}
+
+
+@app.get("/status/{pid}")
+def get_status(pid: int):
+    """Get the status of a specific bot process.
+
+    Args:
+        pid (int): Process ID of the bot
+
+    Returns:
+        JSONResponse: Status information for the bot
+
+    Raises:
+        HTTPException: If the specified bot process is not found
+    """
+    # Look up the subprocess
+    proc = bot_procs.get(pid)
+
+    # If the subprocess doesn't exist, return an error
+    if not proc:
+        raise HTTPException(status_code=404, detail=f"Bot with process id: {pid} not found")
+
+    # Check the status of the subprocess
+    status = "running" if proc[0].poll() is None else "finished"
+    return JSONResponse({"bot_id": pid, "status": status})
+
+@app.post("/upload_pdf")
+async def upload_pdf(file: UploadFile = File(...)):
+    # Verify that the uploaded file is a PDF
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
     
-    # Remove script and style elements
-    for script in soup(["script", "style"]):
-        script.extract()
+    pdf_bytes = await file.read()
     
-    # Extract text
-    text = soup.get_text()
+    try:
+        # Use pdfminer.six to extract text from the PDF
+        pdf_stream = BytesIO(pdf_bytes)
+        extracted_text = extract_text(pdf_stream)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to extract text from PDF: {e}")
     
-    # Clean up text
-    lines = (line.strip() for line in text.splitlines())
-    chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-    text = '\n'.join(chunk for chunk in chunks if chunk)
+    if not extracted_text.strip():
+        raise HTTPException(status_code=400, detail="No extractable text found in the PDF. Ensure it is text-based.")
     
-    return text
+    # Write the extracted text to a file so the bot can include it in its context
+    pdf_context_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_context.txt")
+    try:
+        with open(pdf_context_path, "w", encoding="utf-8") as f:
+            f.write(extracted_text)
+    except UnicodeEncodeError:
+        # If UTF-8 encoding fails, try with a different encoding
+        with open(pdf_context_path, "w", encoding="latin-1") as f:
+            f.write(extracted_text)
+    
+    # Create a flag file to signal a new PDF has been uploaded
+    import datetime
+    flag_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_uploaded.flag")
+    with open(flag_path, "w") as f:
+        f.write(f"PDF uploaded at {datetime.datetime.now()}")
+    
+    return {
+        "detail": "PDF content saved and will be added to bot context.",
+        "text_length": len(extracted_text),
+        "first_100_chars": extracted_text[:100] + "..." if len(extracted_text) > 100 else extracted_text
+    }
 
-def extract_text_from_notion(notion_url):
-    # This is a simplified version - real implementation would use Notion API
-    response = requests.get(notion_url)
-    if response.status_code == 200:
-        return extract_text_from_html(response.text)
+@app.get("/diagnostic_context")
+async def diagnostic_context():
+    conversation_context_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversation_context.json")
+    if os.path.exists(conversation_context_path):
+        with open(conversation_context_path, "r", encoding="utf-8") as f:
+            import json
+            context_data = json.load(f)
+        return {"conversation_context": context_data}
     else:
-        return f"Failed to fetch Notion page: {response.status_code}"
+        return {"message": "No conversation context found."}
 
-def extract_text_from_youtube(youtube_url):
-    # Simplified implementation - real version would use YouTube transcript API
-    st.warning("YouTube transcript extraction is a placeholder. In a real app, this would use the YouTube API.")
-    return f"Placeholder text for transcript from: {youtube_url}"
+@app.get("/debug_pdf_status")
+async def debug_pdf_status():
+    """Endpoint to check the status of PDF processing files."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    pdf_context_path = os.path.join(base_dir, "pdf_context.txt")
+    flag_path = os.path.join(base_dir, "pdf_uploaded.flag")
+    conversation_context_path = os.path.join(base_dir, "conversation_context.json")
+    
+    status = {
+        "pdf_context_exists": os.path.exists(pdf_context_path),
+        "flag_exists": os.path.exists(flag_path),
+        "conversation_context_exists": os.path.exists(conversation_context_path)
+    }
+    
+    if status["pdf_context_exists"]:
+        try:
+            with open(pdf_context_path, "r", encoding="utf-8") as f:
+                text = f.read(200)  # Read first 200 chars for preview
+                status["pdf_context_preview"] = text + "..." if len(text) >= 200 else text
+                status["pdf_context_size"] = os.path.getsize(pdf_context_path)
+        except Exception as e:
+            status["pdf_context_error"] = str(e)
+    
+    return status
 
-def estimate_token_count(text, encoding_name="cl100k_base"):
-    """Estimate the number of tokens in a text using tiktoken."""
-    encoding = tiktoken.get_encoding(encoding_name)
-    return len(encoding.encode(text))
+if __name__ == "__main__":
+    import uvicorn
 
-def smart_chunk_text(text, chunk_size=512, chunk_overlap=100):
-    """
-    Intelligently chunk text respecting semantic boundaries like paragraphs and sentences.
-    """
-    # Initialize text splitter
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=estimate_token_count,
-        separators=["\n\n", "\n", ". ", " ", ""]
+    # Parse command line arguments for server configuration
+    default_host = os.getenv("HOST", "0.0.0.0")
+    default_port = int(os.getenv("FAST_API_PORT", "7860"))
+
+    parser = argparse.ArgumentParser(description="Daily Storyteller FastAPI server")
+    parser.add_argument("--host", type=str, default=default_host, help="Host address")
+    parser.add_argument("--port", type=int, default=default_port, help="Port number")
+    parser.add_argument("--reload", action="store_true", help="Reload code on change")
+
+    config = parser.parse_args()
+
+    # Start the FastAPI server
+    uvicorn.run(
+        "main:app",
+        host=config.host,
+        port=config.port,
+        reload=config.reload,
     )
-    
-    chunks = text_splitter.split_text(text)
-    
-    # Further process chunks to ensure they respect sentence boundaries when possible
-    refined_chunks = []
-    for chunk in chunks:
-        # Check if chunk ends mid-sentence
-        if chunk.endswith(".") or chunk.endswith("?") or chunk.endswith("!"):
-            refined_chunks.append(chunk)
-        else:
-            # Try to find a good breaking point
-            sentences = sent_tokenize(chunk)
-            if len(sentences) > 1:
-                # Join all sentences except the last one
-                refined_chunks.append(" ".join(sentences[:-1]))
-                # Store the last incomplete sentence with the next chunk
-                if len(chunks) > chunks.index(chunk) + 1:
-                    chunks[chunks.index(chunk) + 1] = sentences[-1] + " " + chunks[chunks.index(chunk) + 1]
-            else:
-                refined_chunks.append(chunk)
-                
-    return refined_chunks
+"""
+Bot d'enregistrement de patients utilisant Pipecat et Google Calendar
+Ce script configure un agent conversationnel pour la planification des rendez-vous des patients dans une clinique.
 
-# Setup sidebar configuration
-with st.sidebar:
-    st.header("Settings")
-    
-    # Embedding provider selection
-    embedding_provider = st.selectbox(
-        "Embedding Provider",
-        ["Amazon Bedrock", "OpenAI", "WAS VM (NeMo)", "Mistral API"]
-    )
-    
-    # Provider-specific settings
-    if embedding_provider == "Amazon Bedrock":
-        aws_region = st.text_input("AWS Region", "us-east-1")
-        embedding_model = st.selectbox(
-            "Embedding Model", 
-            ["amazon.titan-embed-text-v1", "cohere.embed-english-v3", "cohere.embed-multilingual-v3"]
-        )
-    elif embedding_provider == "OpenAI":
-        api_key = st.text_input("OpenAI API Key", type="password")
-        os.environ["OPENAI_API_KEY"] = api_key
-    elif embedding_provider == "WAS VM (NeMo)":
-        nemo_url = st.text_input("NeMo API Endpoint", "http://localhost:8000/embeddings")
-    elif embedding_provider == "Mistral API":
-        mistral_api_key = st.text_input("Mistral API Key", type="password")
-    
-    st.header("Chunking Settings")
-    chunk_size = st.slider("Chunk Size (tokens)", 128, 1024, 512)
-    chunk_overlap = st.slider("Chunk Overlap (tokens)", 0, 200, 100)
 
-# Get embedding model based on selected provider
-def get_embeddings_model():
-    if embedding_provider == "Amazon Bedrock":
-        bedrock_client = boto3.client(
-            service_name="bedrock-runtime",
-            region_name=aws_region,
+import asyncio
+import os
+import sys
+import datetime
+import pytz
+import locale
+
+# Set French locale for date formatting
+try:
+    locale.setlocale(locale.LC_TIME, 'fr_FR.UTF-8')
+except:
+    try:
+        locale.setlocale(locale.LC_TIME, 'fr_FR')
+    except:
+        pass  # Fallback to system locale if French is not available
+
+import aiohttp
+from dotenv import load_dotenv
+from loguru import logger
+from runner import configure
+
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.services.openai import OpenAILLMService
+from pipecat.transports.services.daily import DailyParams, DailyTransport
+
+from pipecat.services.deepgram import DeepgramSTTService, Language, LiveOptions
+from pipecat.services.elevenlabs import ElevenLabsTTSService
+
+from pipecat.transports.services.helpers.daily_rest import DailyRESTHelper, DailyRoomParams
+
+
+
+load_dotenv(override=True)
+
+logger.remove(0)
+logger.add(sys.stderr, level="DEBUG")
+
+
+
+async def main():
+    room_url = os.getenv("DAILY_SAMPLE_ROOM_URL")
+
+    async with aiohttp.ClientSession() as session:
+        (room_url, token) = await configure(session)
+
+
+        room_url = os.getenv("DAILY_SAMPLE_ROOM_URL", None)
+        token = os.getenv("DAILY_SAMPLE_ROOM_TOKEN", None)
+        if not room_url:
+            room = await daily_helpers["rest"].create_room(DailyRoomParams())
+            if not room.url:
+                raise HTTPException(status_code=500, detail="Failed to create room")
+            room_url = room.url
+
+            token = await daily_helpers["rest"].get_token(room_url)
+            if not token:
+                raise HTTPException(status_code=500, detail=f"Failed to get token for room: {room_url}")
+
+        transport = DailyTransport(
+            room_url,
+            token,
+            "Test Bot",
+            DailyParams(
+                audio_out_enabled=True,
+                audio_in_enabled=True
+            ),
         )
+
+        # Configure service
+        stt = DeepgramSTTService(
+            api_key=os.getenv("DEEPGRAM_API_KEY"),
+            live_options=LiveOptions(
+                model="nova-2-general",
+
+                smart_format=True,
+                vad_events=True
+            )
+        )
+
+
         
-        return BedrockEmbeddings(
-            client=bedrock_client,
-            model_id=embedding_model
+                # Configure service
+        tts = ElevenLabsTTSService(
+            api_key=os.getenv("ELEVEN_LABS_API_KEY"),
+            voice_id="Xb7hH8MSUJpSbSDYk0k2",
+            sample_rate=24000,
+            params=ElevenLabsTTSService.InputParams(
+
+                stability=1,
+                similarity_boost=1,
+                speed=1
+
+            )
         )
-    elif embedding_provider == "OpenAI":
-        if not api_key:
-            st.error("Please enter an OpenAI API key.")
-            return None
-        return OpenAIEmbeddings()
-    elif embedding_provider == "WAS VM (NeMo)":
-        # This is a placeholder for NeMo embeddings integration
-        # In a real implementation, you would use a custom embeddings class
-        class NemoEmbeddings:
-            def __init__(self, api_url):
-                self.api_url = api_url
+
+        
+        # Define system prompt for the clinic assistant
+        system_prompt = f
+            You are a helpful assistant        
+        
+    
+        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o",params=OpenAILLMService.InputParams(
+        max_tokens=1000,
+   
+    ))
+
+   
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+        ]
+
+        context = OpenAILLMContext(messages)
+
+        context_aggregator = llm.create_context_aggregator(context)
+
+        pipeline = Pipeline(
+            [
+                transport.input(),
+                stt,
+                context_aggregator.user(),
+                llm,
+                tts,
+                transport.output(),
+                context_aggregator.assistant(),
+            ]
+        )
+
+        task = PipelineTask(
+            pipeline,
+            params=PipelineParams(
+                allow_interruptions=True,
+                enable_metrics=True,
+                enable_usage_metrics=True,
+                report_only_initial_ttfb=True,
+            ),
+        )
+
+        @transport.event_handler("on_first_participant_joined")
+        async def on_first_participant_joined(transport, participant):
+            await transport.capture_participant_transcription(participant["id"])
             
-            def embed_query(self, text):
-                # This would make an API call to your NeMo instance
-                # Placeholder implementation
-                response = requests.post(self.api_url, json={"text": text})
-                if response.status_code == 200:
-                    return response.json()["embedding"]
-                else:
-                    raise Exception(f"Failed to get embeddings: {response.status_code}")
-                    
-            def embed_documents(self, documents):
-                # Embed multiple documents
-                return [self.embed_query(doc) for doc in documents]
-                
-        return NemoEmbeddings(nemo_url)
-    elif embedding_provider == "Mistral API":
-        # Placeholder for Mistral API embeddings
-        # In a real implementation, you would use their API
-        class MistralEmbeddings:
-            def __init__(self, api_key):
-                self.api_key = api_key
-                self.api_url = "https://api.mistral.ai/v1/embeddings"
-                
-            def embed_query(self, text):
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                }
-                response = requests.post(
-                    self.api_url,
-                    headers=headers,
-                    json={"input": text, "model": "mistral-embed"}
-                )
-                if response.status_code == 200:
-                    return response.json()["data"][0]["embedding"]
-                else:
-                    raise Exception(f"Failed to get embeddings: {response.status_code}")
-                    
-            def embed_documents(self, documents):
-                return [self.embed_query(doc) for doc in documents]
-                
-        return MistralEmbeddings(mistral_api_key)
-
-# File uploader
-uploaded_file = st.file_uploader("Upload a document (PDF, PPTX, HTML, TXT)", type=["pdf", "pptx", "html", "txt"])
-
-# URL input
-url_input = st.text_input("Or enter a URL (Website, Notion, YouTube)")
-
-# Parse document button
-if st.button("Parse Document"):
-    if uploaded_file is not None:
-        file_extension = uploaded_file.name.split(".")[-1].lower()
-        
-        with st.spinner("Parsing document..."):
-            if file_extension == "pdf":
-                st.session_state.document_content = extract_text_from_pdf(uploaded_file)
-            elif file_extension == "pptx":
-                st.session_state.document_content = extract_text_from_pptx(uploaded_file)
-            elif file_extension == "html":
-                content = uploaded_file.read().decode('utf-8')
-                st.session_state.document_content = extract_text_from_html(content)
-            elif file_extension == "txt":
-                st.session_state.document_content = uploaded_file.read().decode('utf-8')
-                
-        st.success(f"Document parsed successfully! Content length: {len(st.session_state.document_content)} characters")
-        
-        # Display sample of parsed content
-        st.subheader("Sample of Parsed Content")
-        st.text_area("", st.session_state.document_content[:1000] + "...", height=200)
-        
-        # Save doc info
-        doc_info = {
-            "name": uploaded_file.name,
-            "type": file_extension,
-            "size": len(st.session_state.document_content)
-        }
-        st.session_state.parsed_documents.append(doc_info)
-        
-    elif url_input:
-        with st.spinner("Parsing content from URL..."):
-            if "notion.so" in url_input:
-                st.session_state.document_content = extract_text_from_notion(url_input)
-            elif "youtube.com" in url_input or "youtu.be" in url_input:
-                st.session_state.document_content = extract_text_from_youtube(url_input)
-            else:
-                # Treat as general website
-                try:
-                    response = requests.get(url_input)
-                    st.session_state.document_content = extract_text_from_html(response.text)
-                except Exception as e:
-                    st.error(f"Failed to fetch URL: {e}")
-                    
-        st.success(f"Content parsed successfully! Content length: {len(st.session_state.document_content)} characters")
-        
-        # Display sample of parsed content
-        st.subheader("Sample of Parsed Content")
-        st.text_area("", st.session_state.document_content[:1000] + "...", height=200)
-        
-        # Save doc info
-        doc_info = {
-            "name": url_input,
-            "type": "url",
-            "size": len(st.session_state.document_content)
-        }
-        st.session_state.parsed_documents.append(doc_info)
-    else:
-        st.warning("Please upload a file or enter a URL to parse.")
-
-# Process into chunks and create embeddings
-if st.session_state.document_content and st.button("Process & Create Embeddings"):
-    # Check if embedding provider is properly configured
-    embeddings_model = get_embeddings_model()
-    
-    if embeddings_model is None:
-        st.error("Please configure your embedding provider settings properly.")
-    else:
-        with st.spinner("Chunking text and creating embeddings..."):
-            # Smart chunking
-            st.session_state.chunks = smart_chunk_text(
-                st.session_state.document_content, 
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap
+            
+            welcome_message = (
+                f"Hello"
             )
             
-            # Create embeddings for each chunk
-            chunk_embeddings = []
+            await llm.push_frame(TTSSpeakFrame(welcome_message))
             
-            # Process in batches to avoid rate limits and improve performance
-            batch_size = 10
-            for i in range(0, len(st.session_state.chunks), batch_size):
-                batch = st.session_state.chunks[i:i+batch_size]
-                
-                # Update progress
-                progress_text = f"Processing chunks {i+1} to {min(i+batch_size, len(st.session_state.chunks))} of {len(st.session_state.chunks)}"
-                progress_bar = st.progress(i / len(st.session_state.chunks))
-                st.text(progress_text)
-                
-                # Get embeddings for the batch
-                batch_embeddings = embeddings_model.embed_documents(batch)
-                chunk_embeddings.extend(batch_embeddings)
-                
-                # Update progress
-                progress_bar.progress(min((i + batch_size) / len(st.session_state.chunks), 1.0))
-            
-            # Create FAISS index
-            dimension = len(chunk_embeddings[0])
-            index = faiss.IndexFlatL2(dimension)
-            index.add(np.array(chunk_embeddings).astype('float32'))
-            
-            st.session_state.faiss_index = index
-            st.session_state.embeddings = embeddings_model
-            
-        st.success(f"Created {len(st.session_state.chunks)} chunks and built vector index!")
-        
-        # Display chunk info
-        st.subheader("Chunk Information")
-        for i, chunk in enumerate(st.session_state.chunks[:5]):
-            st.text_area(f"Chunk {i+1}", chunk[:200] + "..." if len(chunk) > 200 else chunk, height=100)
-        
-        if len(st.session_state.chunks) > 5:
-            st.write(f"... and {len(st.session_state.chunks) - 5} more chunks")
+            # Queue context frame to prepare for user response
+            await task.queue_frames([context_aggregator.user().get_context_frame()])
 
-# Ask a question section
-st.header("Ask a Question")
-query = st.text_input("Enter your question:")
+        runner = PipelineRunner()
+        await runner.run(task)
 
-if query and st.button("Search") and st.session_state.faiss_index is not None:
-    with st.spinner("Searching for relevant information..."):
-        # Embed the query
-        query_embedding = st.session_state.embeddings.embed_query(query)
-        
-        # Search the index
-        k = min(3, len(st.session_state.chunks))  # Return top 3 results or fewer if we have fewer chunks
-        distances, indices = st.session_state.faiss_index.search(
-            np.array([query_embedding]).astype('float32'), k
-        )
-        
-        # Get the relevant chunks
-        relevant_chunks = [st.session_state.chunks[i] for i in indices[0]]
-        
-        # Display results
-        st.subheader("Search Results")
-        for i, (chunk, distance) in enumerate(zip(relevant_chunks, distances[0])):
-            st.markdown(f"**Result {i+1}** (Distance: {distance:.4f})")
-            st.text_area("", chunk, height=150)
-            
-        # In a real app, here we would pass these chunks to an LLM to get a coherent answer
-        st.info("In a complete implementation, these chunks would be passed to an LLM like GPT-3.5 or GPT-4 to generate a coherent answer to your question.")
 
-# Display parsed documents list
-st.sidebar.header("Parsed Documents")
-for i, doc in enumerate(st.session_state.parsed_documents):
-    st.sidebar.write(f"{i+1}. {doc['name']} ({doc['type']}) - {doc['size']} chars")
+if __name__ == "__main__":
+    asyncio.run(main()) 
 
-# Provide additional information about embedding providers
-with st.expander("About Embedding Providers"):
-    st.write("""
-    ### Amazon Bedrock
-    Best for production use with AWS infrastructure. Offers high-quality embedding models like Titan and Cohere.
-    
-    ### OpenAI
-    Good for development and testing. Provides high-quality embeddings but may have higher latency if you're already on AWS.
-    
-    ### WAS VM (NeMo)
-    Use this if you need to keep everything on-premises or have specialized models running on your WAS VM.
-    
-    ### Mistral API
-    Good option for multilingual content with competitive pricing.
-    
-    For production use with AWS infrastructure, **Amazon Bedrock** is generally recommended for:
-    - Seamless AWS integration
-    - High-quality embedding models
-    - Pay-per-use pricing
-    - Automatic scaling
-    """)
-
-# Add app information
-with st.expander("About this app"):
-    st.write("""
-    This app demonstrates document parsing, smart text chunking, and vector search capabilities:
-    
-    1. **Document Parsing**: Extracts text from PDFs, PPTX files, HTML, and other formats
-    2. **Smart Text Chunking**: Breaks text into semantically meaningful chunks respecting boundaries like paragraphs and sentences
-    3. **Vector Search**: Creates embeddings for chunks and allows searching for relevant information
-    
-    To use this app:
-    1. Select an embedding provider and configure required settings
-    2. Upload a document or enter a URL
-    3. Click "Parse Document"
-    4. Click "Process & Create Embeddings"
-    5. Ask questions about the document
-    """)
+"""
